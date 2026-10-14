@@ -1,0 +1,111 @@
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -55,20 +55,11 @@
+ #[path = "server/control_write_tests.rs"]
+ mod control_write_tests;
+ 
+-type DataChannelRequestSender = mpsc::Sender<bool>;
+-type DataChannelRequestReceiver = mpsc::Receiver<bool>;
++type DataChannelRequestSender = mpsc::UnboundedSender<bool>;
++type DataChannelRequestReceiver = mpsc::UnboundedReceiver<bool>;
+ 
+-const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+-
+-fn data_channel_requests(
+-    service_type: ServiceType,
+-) -> (DataChannelRequestSender, DataChannelRequestReceiver) {
+-    let capacity = if service_type == ServiceType::Tcp {
+-        TCP_POOL_SIZE
+-    } else {
+-        CHAN_SIZE
+-    };
+-    mpsc::channel(capacity)
++fn data_channel_requests(_: ServiceType) -> (DataChannelRequestSender, DataChannelRequestReceiver) {
++    mpsc::unbounded_channel()
+ }
+ 
+ // The entrypoint of running a server
+@@ -456,7 +447,7 @@
+ 
+         if service.service_type != ServiceType::Tcp {
+             for _i in 0..pool_size {
+-                if let Err(e) = data_ch_req_tx.try_send(true) {
++                if let Err(e) = data_ch_req_tx.send(true) {
+                     error!("Failed to request data channel {}", e);
+                 };
+             }
+@@ -561,15 +552,10 @@
+ 
+ impl<T: Transport> ControlChannel<T> {
+     async fn write_and_flush(&mut self, data: &[u8]) -> Result<()> {
+-        tokio::select! {
+-            biased;
+-            _ = self.shutdown_rx.recv() => bail!("Control channel shutdown during write"),
+-            result = time::timeout(CONTROL_WRITE_TIMEOUT, write_and_flush(&mut self.conn, data)) => {
+-                result
+-                    .with_context(|| "Control channel write timed out")?
+-                    .with_context(|| "Failed to write control cmds")
+-            }
+-        }
++        write_and_flush(&mut self.conn, data)
++            .await
++            .with_context(|| "Failed to write control cmds")?;
++        Ok(())
+     }
+     // Run a control channel
+     #[instrument(skip_all)]
+@@ -755,11 +741,7 @@
+                         }
+                         Ok((incoming, addr)) => {
+                             // For every visitor, request to create a data channel
+-                            let request = tokio::select! {
+-                                _ = shutdown_rx.recv() => break,
+-                                result = data_ch_req_tx.send(true) => result,
+-                            };
+-                            if request.with_context(|| "Failed to send data channel create request").is_err() {
++                            if data_ch_req_tx.send(true).with_context(|| "Failed to send data channel create request").is_err() {
+                                 // An error indicates the control channel is broken
+                                 // So break the loop
+                                 break;
+@@ -832,7 +814,7 @@
+                     break;
+                 } else {
+                     // Current data channel is broken. Request for a new one
+-                    if _data_ch_req_tx.send(true).await.is_err() {
++                    if _data_ch_req_tx.send(true).is_err() {
+                         break 'pool;
+                     }
+                 }
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -284,9 +284,7 @@
+     Backend: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+     Connector: std::future::Future<Output = io::Result<Backend>>,
+ {
+-    let mut local = time::timeout(Duration::from_secs(10), connector)
+-        .await
+-        .with_context(|| "Backend TCP connection timed out")??;
++    let mut local = connector.await?;
+     let _ = copy_bidirectional(&mut conn, &mut local).await;
+     Ok(())
+ }
+--- a/src/server/tcp_pool.rs
++++ b/src/server/tcp_pool.rs
+@@ -50,13 +50,10 @@
+         warn!("TCP data channel request expired; replenishing reserve");
+     }
+     while idle + requests.len() < TCP_POOL_SIZE {
+-        match sender.try_send(true) {
+-            Ok(()) => requests.push_back(now + REQUEST_TIMEOUT),
+-            Err(mpsc::error::TrySendError::Full(_)) => break,
+-            Err(error) => {
+-                return Err(error).with_context(|| "Failed to replenish TCP data channel reserve")
+-            }
+-        }
++        sender
++            .send(true)
++            .with_context(|| "Failed to replenish TCP data channel reserve")?;
++        requests.push_back(now + REQUEST_TIMEOUT);
+     }
+     Ok(())
+ }

@@ -177,6 +177,23 @@ struct RunDataChannelArgs<T: Transport> {
     service: ClientServiceConfig,
 }
 
+#[cfg(all(test, feature = "server"))]
+#[tokio::test(start_paused = true)]
+async fn data_channel_creation_cannot_outlive_retry_budget() {
+    let args = Arc::new(RunDataChannelArgs {
+        session_key: [0; HASH_WIDTH_IN_BYTES],
+        remote_addr: AddrMaybeCached::new("127.0.0.1:1"),
+        connector: Arc::new(crate::server::tcp_pool_tests::TestTransport),
+        socket_opts: SocketOpts::from_client_cfg(&ClientServiceConfig::default()),
+        service: ClientServiceConfig::default(),
+    });
+    let result = time::timeout(Duration::from_secs(12), run_data_channel(args)).await;
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "a stalled connect must release its creation task"
+    );
+}
+
 async fn do_data_channel_handshake<T: Transport>(
     args: Arc<RunDataChannelArgs<T>>,
 ) -> Result<T::Stream> {
@@ -216,7 +233,12 @@ async fn do_data_channel_handshake<T: Transport>(
 
 async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Result<()> {
     // Do the handshake
-    let mut conn = do_data_channel_handshake(args.clone()).await?;
+    let mut conn = time::timeout(
+        Duration::from_secs(10),
+        do_data_channel_handshake(args.clone()),
+    )
+    .await
+    .with_context(|| "Data channel creation timed out")??;
 
     // Forward
     match read_data_cmd(&mut conn).await? {
@@ -246,17 +268,32 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
 
 // Simply copying back and forth for TCP
 #[instrument(skip(conn))]
-async fn run_data_channel_for_tcp<T: Transport>(
-    mut conn: T::Stream,
-    local_addr: &str,
-) -> Result<()> {
+async fn run_data_channel_for_tcp<T: Transport>(conn: T::Stream, local_addr: &str) -> Result<()> {
     debug!("New data channel starts forwarding");
-    let mut local = TcpStream::connect(local_addr)
+    forward_tcp(conn, TcpStream::connect(local_addr))
         .await
-        .with_context(|| format!("Failed to connect to {}", local_addr))?;
+        .with_context(|| format!("Failed to connect to {}", local_addr))
+}
+
+async fn forward_tcp<Stream, Backend, Connector>(
+    mut conn: Stream,
+    connector: Connector,
+) -> Result<()>
+where
+    Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    Backend: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    Connector: std::future::Future<Output = io::Result<Backend>>,
+{
+    let mut local = time::timeout(Duration::from_secs(10), connector)
+        .await
+        .with_context(|| "Backend TCP connection timed out")??;
     let _ = copy_bidirectional(&mut conn, &mut local).await;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "client/tcp_startup_tests.rs"]
+mod tcp_startup_tests;
 
 // Things get a little tricker when it gets to UDP because it's connection-less.
 // A UdpPortMap must be maintained for recent seen incoming address, giving them
